@@ -128,6 +128,10 @@ struct Args {
     num_records: u32,
 }
 
+fn page_is_comp(page_hdr: &[u8]) -> bool {
+    (page_header_get_field(page_hdr, PAGE_N_HEAP) & 0x8000) != 0
+}
+
 fn print_page_header(buf: &mut [u8]) {
     let page_header = &mut buf[FIL_PAGE_DATA as usize..];
 
@@ -182,6 +186,8 @@ fn print_page_header(buf: &mut [u8]) {
         "Index id where the page belongs: {}",
         page_header_get_field(page_header, PAGE_INDEX_ID) as u32
     );
+
+    println!("Page is compact: {}", page_is_comp(page_header));
 }
 
 fn main() {
