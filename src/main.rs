@@ -219,7 +219,10 @@ fn main() {
     let page_no = mach_read_from_4(&buf[FIL_PAGE_OFFSET as usize..(FIL_PAGE_OFFSET + 4) as usize]);
     println!("Page Number: {}", page_no);
 
-    if page_no == 0 {
+    let page_type = fil_page_get_type(&buf[FIL_PAGE_TYPE as usize..(FIL_PAGE_TYPE + 4) as usize]);
+    println!("Page Type: {}", fil_print_page_type(page_type));
+
+    if page_type == FIL_PAGE_TYPE_FSP_HDR {
         let serv_version = mach_read_from_4(
             &buf[FIL_PAGE_SRV_VERSION as usize..(FIL_PAGE_SRV_VERSION + 4) as usize],
         );
@@ -233,9 +236,6 @@ fn main() {
         let space_size = mach_read_from_4(&space_header[8..]);
         println!("Space Size (in pages): {}", space_size);
     }
-
-    let page_type = fil_page_get_type(&buf[FIL_PAGE_TYPE as usize..(FIL_PAGE_TYPE + 4) as usize]);
-    println!("Page Type: {}", fil_print_page_type(page_type));
 
     if page_no == 0 {
         println!("Previous Page Number: FIL_NULL (This is the first page)");
