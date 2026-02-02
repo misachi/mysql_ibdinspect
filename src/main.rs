@@ -6,11 +6,13 @@ use clap::Parser;
 
 mod fil0fil;
 mod page0types;
+mod rem0rec;
+mod ut;
 
 use crate::fil0fil::*;
 use crate::page0types::*;
-
-const PAGE_SIZE: u16 = 16384; // 16KB page size
+use crate::rem0rec::rec_get_next_offs;
+use crate::ut::{fil_page_get_type, mach_read_from_2, mach_read_from_4, PAGE_SIZE};
 
 /// Constants copied from Mysql InnoDB source code
 
@@ -110,25 +112,6 @@ const _FIL_PATH_SEPARATOR: u8 = b';';
 
 const FSP_HEADER_OFFSET: u32 = FIL_PAGE_DATA;
 const FSP_SPACE_ID: u32 = 0;
-
-fn mach_read_from_2(buf: &[u8]) -> u16 {
-    (((buf[0] as u64) << 8) | (buf[1] as u64)) as u16
-}
-
-fn mach_read_from_4(buf: &[u8]) -> u32 {
-    ((buf[0] as u32) << 24) | ((buf[1] as u32) << 16) | ((buf[2] as u32) << 8) | (buf[3] as u32)
-}
-
-fn fil_page_get_type(buf: &[u8]) -> u16 {
-    mach_read_from_2(&buf)
-}
-
-fn _mach_write_to_4(buf: &mut [u8], n: u32) {
-    buf[0] = (n >> 24) as u8;
-    buf[1] = (n >> 16) as u8;
-    buf[2] = (n >> 8) as u8;
-    buf[3] = (n) as u8;
-}
 
 fn page_header_get_field(page_hdr: &[u8], field: u32) -> u16 {
     mach_read_from_2(&page_hdr[field as usize..])
