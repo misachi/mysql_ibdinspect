@@ -122,6 +122,10 @@ struct Args {
     /// Path to the InnoDB tablespace file (.ibd file)
     #[arg(short = 'f', long)]
     file: PathBuf,
+    #[arg(short = 'n', long, default_value_t = 0)]
+    page_number: u32,
+    #[arg(short = 'r', long, default_value_t = 0)]
+    num_records: u32,
 }
 
 fn print_page_header(buf: &mut [u8]) {
@@ -187,8 +191,13 @@ fn main() {
     let mut file = File::open(args.file).expect("Failed to open file");
     let mut buf = [0u8; PAGE_SIZE as usize];
 
-    file.seek(SeekFrom::Start(PAGE_SIZE as u64 * 0))
+    file.seek(SeekFrom::Start(PAGE_SIZE as u64 * args.page_number as u64))
         .expect("Failed to seek to start");
+
+    let mut rec_nr = args.num_records;
+    if rec_nr == 0 {
+        rec_nr = page_header_get_field(&buf[FIL_PAGE_DATA as usize..], PAGE_N_RECS) as u32;
+    }
 
     println!("Reading Filespace Header:");
     file.read_exact(&mut buf)
