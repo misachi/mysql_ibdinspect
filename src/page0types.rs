@@ -1,3 +1,5 @@
+use crate::rem0rec::{REC_N_NEW_EXTRA_BYTES, _REC_N_OLD_EXTRA_BYTES};
+
 /// Constants copied from Mysql InnoDB source code
 
 /*                      PAGE HEADER
@@ -61,4 +63,17 @@ a B-tree, but not in the root of an ibuf
 tree */
 /*----*/
 /** start of data on the page */
-pub const _PAGE_DATA: u32 = PAGE_HEADER + 36 + 2 * _FSEG_HEADER_SIZE;
+pub const PAGE_DATA: u32 = PAGE_HEADER + 36 + 2 * _FSEG_HEADER_SIZE;
+
+/** offset of the page infimum record on a new-style compact page */
+pub const PAGE_NEW_INFIMUM: u32 = PAGE_DATA + REC_N_NEW_EXTRA_BYTES;
+
+/** offset of the page supremum record on a new-style compact page */
+pub const PAGE_NEW_SUPREMUM: u32 = PAGE_DATA + 2 * REC_N_NEW_EXTRA_BYTES + 8;
+
+/** offset of the page supremum record end on a new-style compact page */
+pub const PAGE_NEW_SUPREMUM_END: u32 = PAGE_NEW_SUPREMUM + 8;
+/** offset of the page infimum record on an old-style page */
+pub const _PAGE_OLD_INFIMUM: u32 = PAGE_DATA + 1 + _REC_N_OLD_EXTRA_BYTES;
+pub const _PAGE_OLD_SUPREMUM: u32 = PAGE_DATA + 2 + 2 * _REC_N_OLD_EXTRA_BYTES + 8;
+pub const _PAGE_OLD_SUPREMUM_END: u32 = _PAGE_OLD_SUPREMUM + 8;
