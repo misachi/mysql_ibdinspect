@@ -250,6 +250,32 @@ fn main() {
 
     print_page_header(&mut buf);
 
+    let rec_infi = &buf[PAGE_NEW_INFIMUM as usize..(PAGE_NEW_INFIMUM + 8) as usize];
+    println!("\nInfimum Record Data: {}", String::from_utf8_lossy(rec_infi));
+
+    let rec_supremum = &buf[(PAGE_NEW_SUPREMUM) as usize..(PAGE_NEW_SUPREMUM_END) as usize];
+    println!("\nSupremum Record Data: {}", String::from_utf8_lossy(rec_supremum));
+
+    let mut off = PAGE_NEW_INFIMUM;
+    let comp = page_is_comp(&buf) as u32;
+    while rec_nr > 0 {
+        let rec_start_off = rec_get_next_offs(&buf, off, comp);
+        if rec_start_off > PAGE_SIZE as u32 {
+            eprintln!("Record start offset exceeds page size...stopping.");
+            break;
+        }
+
+        off += rec_start_off;
+        let rec_end_off = rec_get_next_offs(&buf, off, comp);
+        if rec_end_off > PAGE_SIZE as u32 {
+            eprintln!("Record end offset exceeds page size...stopping.");
+            break;
+        }
+        let rec = &buf[off as usize..(off + rec_end_off) as usize];
+        println!("Data: {}", String::from_utf8_lossy(rec));
+        rec_nr -= 1;
+    }
+
     // buf.fill(0);
 }
 
