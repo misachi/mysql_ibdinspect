@@ -7,7 +7,7 @@ If you have `Rust` installed on your system, clone the repository and run the co
 cargo run -- -f <path_to_ibd_file> -n <page_number_to_read> -r <number_of_records_to_display>  # where path_to_ibd_file is the .ibd file path, page_number_to_read is the page index to read(e.g from 0 - Space Size (in pages)), number_of_records_to_display is the number of records in the page to print to screen
 ```
 
-Sample results for the first page using the command `cargo run -- -f /home/user/mysql_ibdinspect/sbtest1.ibd -n 4 -r 10` (reads the first page and displays 10 records, if found):
+Sample results for the first page using the command `cargo run -- -f /home/user/mysql_ibdinspect/sbtest1.ibd -n 0 -r 10` (reads the first page and displays 10 records, if found):
 ```
 Reading Filespace Header:
 Filespace ID: 14

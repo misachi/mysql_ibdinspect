@@ -107,6 +107,8 @@ pub const FIL_PAGE_TYPE_ZLOB_FRAG_ENTRY: u16 = 29;
 /** Note the highest valid non-index page_type_t. */
 pub const _FIL_PAGE_TYPE_LAST: u16 = FIL_PAGE_TYPE_ZLOB_FRAG_ENTRY;
 
+pub const FIL_NULL: u32 = u32::MAX;
+
 pub fn fil_print_page_type(page_type: u16) -> &'static str {
     match page_type {
         FIL_PAGE_INDEX => "FIL_PAGE_INDEX",
