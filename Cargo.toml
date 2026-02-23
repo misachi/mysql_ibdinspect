@@ -1,5 +1,5 @@
 [package]
-name = "mysql_pageinspect"
+name = "mysql_ibdinspect"
 version = "0.1.0"
 edition = "2024"
 
