@@ -1,4 +1,5 @@
 use crate::rem0rec::{REC_N_NEW_EXTRA_BYTES, _REC_N_OLD_EXTRA_BYTES};
+use crate::ut::mach_read_from_2;
 
 /// Constants copied from Mysql InnoDB source code
 
@@ -77,3 +78,11 @@ pub const PAGE_NEW_SUPREMUM_END: u32 = PAGE_NEW_SUPREMUM + 8;
 pub const _PAGE_OLD_INFIMUM: u32 = PAGE_DATA + 1 + _REC_N_OLD_EXTRA_BYTES;
 pub const _PAGE_OLD_SUPREMUM: u32 = PAGE_DATA + 2 + 2 * _REC_N_OLD_EXTRA_BYTES + 8;
 pub const _PAGE_OLD_SUPREMUM_END: u32 = _PAGE_OLD_SUPREMUM + 8;
+
+pub(crate) fn page_header_get_field(page_hdr: &[u8], field: u32) -> u16 {
+    mach_read_from_2(&page_hdr[field as usize..])
+}
+
+pub(crate) fn page_is_comp(page: &[u8]) -> bool {
+    (page_header_get_field(page, PAGE_HEADER + PAGE_N_HEAP) & 0x8000) != 0
+}
