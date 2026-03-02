@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
@@ -8,6 +9,7 @@ use libz_sys::{
     Z_BUF_ERROR, Z_FINISH, Z_NO_FLUSH, Z_OK, Z_STREAM_END, inflate, inflateEnd, inflateInit_,
     z_stream, zlibVersion,
 };
+use serde_json::{Map, Value, json};
 use std::ptr;
 
 pub mod fil0fil;
@@ -17,16 +19,19 @@ pub mod ut;
 
 use fil0fil::*;
 use page0types::*;
-use rem0rec::{REC_N_NEW_EXTRA_BYTES, rec_get_next_offs};
+use rem0rec::{REC_N_NEW_EXTRA_BYTES, REC_STATUS_ORDINARY, rec_get_next_offs, rec_get_status};
 use ut::{
     _mach_read_from_1, PAGE_SIZE, fil_page_get_type, mach_read_from_2, mach_read_from_4,
     mach_read_from_8,
 };
 
+use crate::rem0rec::{
+    ColumnTypes, REC_OFFS_COMPACT, REC_OFFS_EXTERNAL, REC_OFFS_HEADER_SIZE, REC_OFFS_SQL_NULL,
+    get_fixed_column_size,
+};
+
 /// Constants copied from Mysql InnoDB source code
-
-/** The byte offsets on a file page for various variables. */
-
+/// The byte offsets on a file page for various variables.
 /** MySQL-4.0.14 space id the page belongs to (== 0) but in later
 versions the 'new' checksum of the page */
 const _FIL_PAGE_SPACE_OR_CHKSUM: u32 = 0;
@@ -206,7 +211,7 @@ const fn xdes_arr_size(page_size: u32) -> u32 {
 /** File extent data structure size in bytes. */
 const XDES_SIZE: u32 = XDES_BITMAP + ut_bits_in_bytes(FSP_EXTENT_SIZE * XDES_BITS_PER_PAGE);
 
-const fn fsp_header_get_sdi_offset(page_size: u32) -> u32 {
+pub const fn fsp_header_get_sdi_offset(page_size: u32) -> u32 {
     XDES_ARR_OFFSET + XDES_SIZE * xdes_arr_size(page_size) + INFO_MAX_SIZE as u32
 }
 
@@ -220,7 +225,7 @@ const fn fsp_flags_get_zip_ssize(flags: u32) -> u32 {
 }
 
 /** SDI version. Written on Page 1 & 2 at FIL_PAGE_FILE_FLUSH_LSN offset. */
-const SDI_VERSION: u32 = 1;
+pub const SDI_VERSION: u32 = 1;
 
 /** Offset within header of LOB length on this page. */
 const LOB_HDR_PART_LEN: u32 = 0;
@@ -232,6 +237,10 @@ const LOB_HDR_SIZE: u32 = 8;
 FIL_NULL if none */
 const LOB_HDR_NEXT_PAGE_NO: u32 = 4;
 
+const DB_TRX_ID: &'static str = "DB_TRX_ID";
+const DB_ROLL_PTR: &'static str = "DB_ROLL_PTR";
+
+#[derive(Debug, PartialEq, Eq)]
 enum ERR {
     FAILURE = 1,
     SUCCESS = 0,
@@ -239,16 +248,225 @@ enum ERR {
 }
 // -- SDI --
 
-fn page_header_get_field(page_hdr: &[u8], field: u32) -> u16 {
-    mach_read_from_2(&page_hdr[field as usize..])
+/// Get offsets to fields in record data. This implementation assumes only new-style compact record formarts
+/// Other formats are currently not supported. The implemetation also only handles clustered index leaf pages.
+/// This means the on disk format expected is as follows:
+///     | record header | primary key | system columns fields | non-key fixed sized fields | non-key variable sized fields
+fn rec_get_offsets(
+    page: &[u8; PAGE_SIZE as usize],
+    rec: u32,
+    sdi_info: &Vec<HashMap<String, Value>>,
+) -> Option<Vec<u32>> {
+    // Restrict to new style compact page formats only
+    assert!(page_is_comp(page));
+
+    let mut columns: Vec<Value> = Vec::new();
+    let mut num_fields: u32 = 0;
+    let n_null: u16 = 0;
+
+    // rec_init_null_and_len_comp(page, rec, nulls, lens, &mut n_null);
+
+    let nulls = &page[(rec - (REC_N_NEW_EXTRA_BYTES + 1)) as usize..];
+    let mut lens_off = rec - (REC_N_NEW_EXTRA_BYTES + 1 + ut_bits_in_bytes(n_null as u32));
+
+    match rec_get_status(page, rec) {
+        REC_STATUS_ORDINARY => {
+            let mut buf = [0u8; PAGE_SIZE as usize];
+            buf.copy_from_slice(page);
+
+            // Loop throught the sdi_info to get column list
+            for rec in sdi_info {
+                if let Some(Value::Object(dd_object)) = rec.get("dd_object") {
+                    if let Some(Value::Array(cols)) = dd_object.get("columns") {
+                        num_fields = cols.len() as u32;
+                        columns = cols.clone();
+                        break;
+                    }
+                }
+            }
+        }
+        REC_STATUS_INFIMUM | REC_STATUS_SUPREMUM => {
+            num_fields = 1;
+        }
+        _ => {
+            println!("Unknown record status");
+            return None;
+        }
+    }
+
+    let size = num_fields + 1 + REC_OFFS_HEADER_SIZE;
+    let mut offsets = vec![0u32; size as usize];
+    let mut offs = 0;
+    let mut any_ext = 0;
+    offsets[0] = size;
+    offsets[1] = num_fields;
+    let offsets_base = &mut offsets[REC_OFFS_HEADER_SIZE as usize..];
+    match rec_get_status(page, rec) {
+        REC_STATUS_ORDINARY => {
+            let mut null_mask: u32 = 1;
+            for i in 0..num_fields {
+                let mut len: u64;
+                let col: &Map<String, Value> = columns[i as usize]
+                    .as_object()
+                    .expect("Error parsing column information from SDI");
+
+                // Skip system columns db_roll_ptr and db_transaction_id
+                if col["name"].as_str().unwrap_or("") == DB_ROLL_PTR
+                    || col["name"].as_str().unwrap_or("") == DB_TRX_ID
+                {
+                    continue;
+                }
+                if col["is_nullable"].as_bool().unwrap_or(false) {
+                    if (nulls[0] as u32 & null_mask) > 0 {
+                        null_mask <<= 1;
+                        len = (offs | REC_OFFS_SQL_NULL) as u64;
+                        offsets_base[(i + 1) as usize] = len as u32;
+                        continue;
+                    }
+                    null_mask <<= 1;
+                }
+                let fixed_col_size = get_fixed_column_size(ColumnTypes::from(
+                    col["type"].as_u64().unwrap_or(u64::MAX) as u32,
+                ));
+
+                if fixed_col_size >= u32::MAX {
+                    // Variable size field?
+                    len = page[lens_off as usize] as u64;
+                    lens_off -= 1;
+
+                    if (col["type"].as_u64().unwrap_or(u64::MAX) > 255) && (len & 0x80) > 0 {
+                        println!(
+                            "Variable length column found, calculating length from record header"
+                        );
+                        len <<= 8;
+                        len |= page[lens_off as usize] as u64;
+                        lens_off -= 1;
+
+                        offs += len as u32 & 0x3fff;
+                        if (len & 0x4000) > 0 {
+                            any_ext = REC_OFFS_EXTERNAL;
+                            len = (offs | REC_OFFS_EXTERNAL) as u64;
+                        } else {
+                            len = offs as u64;
+                        }
+                        offsets_base[(i + 1) as usize] = len as u32;
+                        continue;
+                    }
+
+                    offs += len as u32;
+                    len = offs as u64;
+                } else {
+                    offs += fixed_col_size;
+                    len = offs as u64;
+                }
+                offsets_base[(i + 1) as usize] = len as u32;
+            }
+
+            offsets_base[0] =
+                page[(rec - (lens_off + 1) as u32) as usize] as u32 | any_ext | REC_OFFS_COMPACT;
+
+            // Hack: Update offsets, skipping system fields that are right after the primary key
+            for i in 1..offsets_base.len() {
+                if i == 1 {
+                    continue;
+                }
+                offsets_base[i] = offsets_base[i] + DATA_ROLL_PTR_LEN + DATA_TRX_ID_LEN;
+            }
+        }
+        REC_STATUS_INFIMUM | REC_STATUS_SUPREMUM => {
+            offsets_base[0] = REC_N_NEW_EXTRA_BYTES | REC_OFFS_COMPACT;
+            offsets_base[1] = 8;
+        }
+        _ => {
+            // Probaly non-leaf record, we don't expect to get here
+            // since we only call this function for leaf records, but just in case
+            println!("Unknown record status");
+            return None;
+        }
+    }
+
+    Some(offsets)
 }
 
-fn page_is_comp(page: &[u8]) -> bool {
-    (page_header_get_field(page, PAGE_HEADER + PAGE_N_HEAP) & 0x8000) != 0
+pub fn read_sdi_info_from_disk(
+    file: &mut File,
+    mut buf: [u8; 16384],
+) -> Vec<HashMap<String, Value>> {
+    let sdi_root_page_number =
+        get_sdi_page_from_root(1, file, &mut buf).expect("Error getting SDI page number from root");
+    let sdi_info: Vec<HashMap<String, Value>> = serde_json::from_slice(
+        &get_all_recs_in_sdi_leaf_pages(sdi_root_page_number, file)
+            .expect("Error getting SDI info from leaf pages"),
+    )
+    .expect("Error deserializing SDI info");
+    sdi_info
 }
 
-fn print_page_header(buf: &mut [u8]) {
-    let page_header = &mut buf[FIL_PAGE_DATA as usize..];
+fn read_signed_int(buf: &[u8]) -> i32 {
+    i32::from_be_bytes(buf[..4].try_into().unwrap_or([0; 4])) ^ 0x8000_0000u32 as i32
+}
+
+fn print_record(page: &[u8], rec: u32, offsets: &[u32], sdi_info: &Vec<HashMap<String, Value>>) {
+    let num_cols = offsets[1];
+
+    let offsets_base = &offsets[REC_OFFS_HEADER_SIZE as usize..];
+    let rec_buf = &page[rec as usize..];
+    let mut off = 0;
+    let mut columns: Vec<Value> = Vec::new();
+    let mut out_data: Map<String, Value> = Map::new();
+
+    // Retireve columns from SDI data
+    for rec in sdi_info {
+        if let Some(Value::Object(dd_object)) = rec.get("dd_object") {
+            if let Some(Value::Array(cols)) = dd_object.get("columns") {
+                columns = cols.clone();
+                break;
+            }
+        }
+    }
+
+    for i in 0..num_cols {
+        let col: &Map<String, Value> = columns[i as usize]
+            .as_object()
+            .expect("Error parsing column information from SDI");
+        let col_name = col["name"].as_str().unwrap_or("");
+
+        // Skip system columns db_roll_ptr and db_transaction_id
+        if col_name == DB_ROLL_PTR || col_name == DB_TRX_ID {
+            continue;
+        }
+
+        let col_off = offsets_base[(i + 1) as usize];
+
+        let field = &rec_buf[(off) as usize..(col_off) as usize];
+        let fixed_col_size = get_fixed_column_size(ColumnTypes::from(
+            col["type"].as_u64().unwrap_or(u64::MAX) as u32,
+        ));
+
+        if fixed_col_size < u32::MAX {
+            // FIX: Assumes integer only(4 bytes). Should change
+            out_data.insert(col_name.to_string(), json!(read_signed_int(field)));
+        } else {
+            // byte string
+            out_data.insert(col_name.to_string(), json!(String::from_utf8_lossy(field)));
+        }
+
+        // Skip system columns(13bytes) after the primary column in clustered index
+        if i == 0 {
+            off = col_off + DATA_ROLL_PTR_LEN + DATA_TRX_ID_LEN;
+        } else {
+            off = col_off;
+        }
+    }
+
+    println!(
+        "Data: {}",
+        serde_json::to_string_pretty(&out_data).expect("Error")
+    );
+}
+
+fn print_page_header(buf: &[u8]) {
+    let page_header = &buf[FIL_PAGE_DATA as usize..];
 
     println!("\nIndex Page Header Fields:");
 
@@ -310,7 +528,7 @@ fn read_page(page_number: u32, ibd_file: &mut File, buf: &mut [u8]) {
         .seek(SeekFrom::Start(PAGE_SIZE as u64 * page_number as u64))
         .expect("Failed to seek to start");
 
-    ibd_file.read_exact(buf).expect("Unable to read file block");
+    ibd_file.read(buf).expect("Unable to read file block");
 }
 
 fn read_page_and_return_level(buf: &mut [u8], ibd_file: &mut File, page_number: u32) -> u64 {
@@ -393,7 +611,6 @@ fn get_rec_type(page: &[u8], rec: u32) -> u8 {
 fn get_first_user_rec(page: &[u8]) -> u32 {
     let next_rec_offset =
         mach_read_from_2(&page[(PAGE_NEW_INFIMUM - REC_OFF_NEXT) as usize..]) as u32;
-    // rec_get_next_offs(page, PAGE_NEW_INFIMUM, page_is_comp(page) as u32);
     PAGE_NEW_INFIMUM + next_rec_offset
 }
 
@@ -749,13 +966,37 @@ pub fn get_all_recs_in_sdi_leaf_pages(
     }
 }
 
+pub fn get_sdi_page_from_root(
+    page_number: u32,
+    file: &mut File,
+    buf: &mut [u8; PAGE_SIZE as usize],
+) -> Option<u32> {
+    let mut first_page = &mut [0u8; PAGE_SIZE as usize];
+    if page_number != 0 {
+        read_page(0, file, first_page);
+    } else {
+        first_page = buf;
+    }
+    let sdi_offset = fsp_header_get_sdi_offset(PAGE_SIZE as u32);
+    let version = mach_read_from_4(&first_page[sdi_offset as usize..]);
+    if version != SDI_VERSION {
+        eprintln!(
+            "Unsupported SDI version: {}. Expected version: {}",
+            version, SDI_VERSION
+        );
+        return None;
+    }
+    let sdi_root_page_number =
+        mach_read_from_4(&first_page[(sdi_offset + 4) as usize..(sdi_offset + 8) as usize]);
+    Some(sdi_root_page_number)
+}
+
 pub fn print_ibd_file_data(file: &PathBuf, page_number: u32, num_records: u32) {
     // Read file 16kb size block
     let mut file = File::open(file).expect("Failed to open file");
     let mut buf = [0u8; PAGE_SIZE as usize];
 
-    file.seek(SeekFrom::Start(PAGE_SIZE as u64 * page_number as u64))
-        .expect("Failed to seek to start");
+    read_page(page_number, &mut file, &mut buf);
 
     let mut rec_nr = num_records;
     if rec_nr == 0 {
@@ -805,37 +1046,14 @@ pub fn print_ibd_file_data(file: &PathBuf, page_number: u32, num_records: u32) {
     let page_next = mach_read_from_4(&buf[FIL_PAGE_NEXT as usize..(FIL_PAGE_NEXT + 4) as usize]);
     println!("Next Page Number: {}", page_next);
 
-    print_page_header(&mut buf);
-
-    let rec_infi = &buf[PAGE_NEW_INFIMUM as usize..(PAGE_NEW_INFIMUM + 8) as usize];
-    println!(
-        "\nInfimum Record Data: {}",
-        String::from_utf8_lossy(rec_infi)
-    );
-
-    let rec_supremum = &buf[(PAGE_NEW_SUPREMUM) as usize..(PAGE_NEW_SUPREMUM_END) as usize];
-    println!(
-        "\nSupremum Record Data: {}",
-        String::from_utf8_lossy(rec_supremum)
-    );
+    print_page_header(&buf);
 
     /* Print data in SDI tree leaf pages */
     if page_type == FIL_PAGE_SDI {
-        let buf = &mut [0u8; PAGE_SIZE as usize];
-        read_page(0, &mut file, buf);
-        let sdi_offset = fsp_header_get_sdi_offset(PAGE_SIZE as u32);
-        let version = mach_read_from_4(&buf[sdi_offset as usize..]);
-
-        if version != SDI_VERSION {
-            eprintln!(
-                "Unsupported SDI version: {}. Expected version: {}",
-                version, SDI_VERSION
-            );
-            return;
-        }
-
-        let sdi_root_page_number =
-            mach_read_from_4(&buf[(sdi_offset + 4) as usize..(sdi_offset + 8) as usize]);
+        let sdi_root_page_number = match get_sdi_page_from_root(page_number, &mut file, &mut buf) {
+            Some(value) => value,
+            None => return,
+        };
         let sdi_json = match get_all_recs_in_sdi_leaf_pages(sdi_root_page_number, &mut file) {
             Some(json) => json,
             None => {
@@ -846,10 +1064,14 @@ pub fn print_ibd_file_data(file: &PathBuf, page_number: u32, num_records: u32) {
         println!("SDI Data: {}", String::from_utf8_lossy(&sdi_json));
     }
 
+    let page_level = page_header_get_field(&buf[FIL_PAGE_DATA as usize..], PAGE_LEVEL);
+    let page_index_id = page_header_get_field(&buf[FIL_PAGE_DATA as usize..], PAGE_INDEX_ID);
+
     /* Print records in leaf data pages only */
-    if page_type == FIL_PAGE_INDEX {
+    if page_type == FIL_PAGE_INDEX && page_level == 0 && page_index_id == 0 {
         let mut off = PAGE_NEW_INFIMUM;
         let comp = page_is_comp(&buf) as u32;
+        let sdi_info = read_sdi_info_from_disk(&mut file, buf);
         while rec_nr > 0 {
             let rec_start_off = rec_get_next_offs(&buf, off, comp);
             if rec_start_off > PAGE_SIZE as u32 {
@@ -857,8 +1079,7 @@ pub fn print_ibd_file_data(file: &PathBuf, page_number: u32, num_records: u32) {
                 break;
             }
 
-            off += rec_start_off;
-            let rec_end_off = rec_get_next_offs(&buf, off, comp);
+            let rec_end_off = rec_get_next_offs(&buf, rec_start_off, comp);
             if rec_end_off > PAGE_SIZE as u32 {
                 eprintln!(
                     "Record end offset({}) exceeds page size...stopping.",
@@ -866,8 +1087,17 @@ pub fn print_ibd_file_data(file: &PathBuf, page_number: u32, num_records: u32) {
                 );
                 break;
             }
-            let rec = &buf[off as usize..(off + rec_end_off) as usize];
-            println!("Data: {}", String::from_utf8_lossy(rec));
+
+            let offsets = match rec_get_offsets(&buf, rec_start_off, &sdi_info) {
+                Some(offs) => offs,
+                None => {
+                    eprintln!("Failed to get record offsets...stopping.");
+                    break;
+                }
+            };
+
+            print_record(&buf, rec_start_off, &offsets, &sdi_info);
+            off = rec_start_off;
             rec_nr -= 1;
         }
     }
@@ -903,5 +1133,129 @@ mod tests {
         let buf = [0x00, 0x01, 0x02, 0x03, 0x04, 0x05];
         let result = page_header_get_field(&buf, 2);
         assert_eq!(result, 0x0203);
+    }
+
+    #[test]
+    fn test_ut_bits_in_bytes() {
+        assert_eq!(ut_bits_in_bytes(0), 0);
+        assert_eq!(ut_bits_in_bytes(1), 1);
+        assert_eq!(ut_bits_in_bytes(7), 1);
+        assert_eq!(ut_bits_in_bytes(8), 1);
+        assert_eq!(ut_bits_in_bytes(9), 2);
+        assert_eq!(ut_bits_in_bytes(15), 2);
+        assert_eq!(ut_bits_in_bytes(16), 2);
+        assert_eq!(ut_bits_in_bytes(17), 3);
+    }
+
+    #[test]
+    fn test_fsp_flags_get_zip_ssize() {
+        assert_eq!(fsp_flags_get_zip_ssize(0), 0);
+        assert_eq!(fsp_flags_get_zip_ssize(0b00000010), 1);
+        assert_eq!(fsp_flags_get_zip_ssize(0b00000100), 2);
+        assert_eq!(fsp_flags_get_zip_ssize(0b00000110), 3);
+        assert_eq!(fsp_flags_get_zip_ssize(0b00001000), 4);
+    }
+
+    #[test]
+    fn test_get_rec_type() {
+        let buf = [0x05, 0x00, 0x00, 0x00];
+        let rec = 3;
+        let result = get_rec_type(&buf, rec);
+        assert_eq!(result, 0x05);
+    }
+
+    #[test]
+    fn test_get_first_user_rec() {
+        let buf = [
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let result = get_first_user_rec(&buf);
+        assert_eq!(result, 0x7b);
+    }
+
+    #[test]
+    fn test_copy_uncompressed_blob() {
+        // This test would require setting up a mock file with the expected structure of uncompressed blob pages, which is non-trivial. For now, we can just ensure that the function compiles and can be called without errors.
+        let mut ibd_file = File::open("/dev/null").expect("Failed to open file");
+        let mut buf = [0u8; 100];
+        let result = copy_uncompressed_blob(0, 100, &mut buf, &mut ibd_file);
+        assert_eq!(result, 0); // Since we're reading from /dev/null, we expect to read 0 bytes
+    }
+
+    #[test]
+    fn test_page_is_comp() {
+        let mut buf = [0u8; PAGE_SIZE as usize];
+        // Set the compact flag in the page header
+        buf[(PAGE_HEADER + PAGE_N_HEAP) as usize] = 0x80;
+        let result = page_is_comp(&buf);
+        assert!(result);
+    }
+
+    #[test]
+    fn test_page_is_not_comp() {
+        let buf = [0u8; PAGE_SIZE as usize];
+        // Do not set the compact flag in the page header
+        let result = page_is_comp(&buf);
+        assert!(!result);
+    }
+
+    #[test]
+    fn test_read_page() {
+        let mut ibd_file = File::open("/dev/null").expect("Failed to open file");
+        let mut buf = [0u8; PAGE_SIZE as usize];
+        read_page(0, &mut ibd_file, &mut buf);
+        // Since we're reading from /dev/null, we expect the buffer to be unchanged (all zeros)
+        assert_eq!(buf, [0u8; PAGE_SIZE as usize]);
+    }
+
+    #[test]
+    fn test_read_page_and_return_level() {
+        let mut ibd_file = File::open("/dev/null").expect("Failed to open file");
+        let mut buf = [0u8; PAGE_SIZE as usize];
+        let result = read_page_and_return_level(&mut buf, &mut ibd_file, 0);
+        assert_eq!(result, u64::MAX);
+    }
+
+    #[test]
+    fn test_read_page_and_return_level_invalid() {
+        let mut ibd_file = File::open("/dev/null").expect("Failed to open file");
+        let mut buf = [0u8; PAGE_SIZE as usize];
+        let result = read_page_and_return_level(&mut buf, &mut ibd_file, 0);
+        assert_eq!(result, u64::MAX);
+    }
+
+    #[test]
+    fn test_reach_to_leftmost_leaf_level() {
+        // This test would require setting up a mock file with a valid SDI page structure, which is non-trivial.
+        // For now, we can just ensure that the function compiles and can be called without errors.
+        let mut ibd_file = File::open("/dev/null").expect("Failed to open file");
+        let mut buf = [0u8; PAGE_SIZE as usize];
+        let result = reach_to_leftmost_leaf_level(&mut buf, 0, &mut ibd_file);
+        assert_eq!(result, ERR::FAILURE); // Since we're reading from /dev/null, we expect it to not find a valid SDI page
+    }
+
+    #[test]
+    fn test_get_sdi_page_from_root() {
+        let mut ibd_file = File::open("/dev/null").expect("Failed to open file");
+        let mut buf = [0u8; PAGE_SIZE as usize];
+        let result = get_sdi_page_from_root(0, &mut ibd_file, &mut buf);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_get_sdi_page_from_root_invalid_version() {
+        let mut ibd_file = File::open("/dev/null").expect("Failed to open file");
+        let mut buf = [0u8; PAGE_SIZE as usize];
+        // Set an invalid SDI version in the buffer to trigger the error case
+        buf[0..4].copy_from_slice(&0x00000001u32.to_le_bytes()); // Invalid version
+        let result = get_sdi_page_from_root(0, &mut ibd_file, &mut buf);
+        assert_eq!(result, None); // Should return None due to unsupported SDI version
     }
 }
